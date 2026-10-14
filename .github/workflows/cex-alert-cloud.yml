@@ -1,0 +1,69 @@
+name: CeX RTX 5090 alert
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Send a test alert for a fake card"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency: cex-alert
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check CeX UK stock
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          CEX_TEST: ${{ inputs.test && '1' || '' }}
+        run: |
+          STATE=instock.txt
+          touch "$STATE"
+          RESP=$(curl -sf --max-time 30 "https://search.webuy.io/1/indexes/prod_cex_uk/query" \
+            -H "x-algolia-api-key: bf79f2b6699e60a18ae330a1248b452c" \
+            -H "x-algolia-application-id: LNNFEEWZVA" -H "Referer: https://uk.webuy.com/" \
+            -d '{"query":"5090","hitsPerPage":500,"typoTolerance":false,"attributesToRetrieve":["boxId","boxName","sellPrice","ecomQuantity","stores","categoryFriendlyName"]}')
+          NOW=$(echo "$RESP" | jq -r '.hits[]
+            | select(.categoryFriendlyName=="PCI-Express Graphics Cards" or ((.boxName|test("(^|[/ ])((RTX|GTX|GeForce) ?)?5090( ?(16|24|32) ?GB?)?(/| |$)";"i")) and (.boxName|test("Dell (G5|OptiPlex|5090)";"i")|not)))
+            | select(.categoryFriendlyName|test("Graphics|Desktop"))
+            | select((.ecomQuantity>0) or ((.stores|length)>0))
+            | "\(.boxId)\t£\(.sellPrice)\t\(.boxName)\t\(.stores|join(", "))"' | sort)
+          # Test mode adds a fake in-stock card; it is never saved
+          [ -n "$CEX_TEST" ] && NOW=$(printf '%s\nTESTCARD5090\t£2935\tTEST - Zotac GeForce RTX 5090 Solid OC 32GB\tWest Bromwich' "$NOW" | sed '/^$/d')
+          NEW=$(comm -13 <(cut -f1 "$STATE" | sort) <(echo "$NOW" | cut -f1 | sed '/^$/d'))
+          # If the Mac checker sent a heartbeat in the last 20 min, skip items it already covered
+          MAC=$(curl -s --max-time 15 "https://ntfy.sh/$NTFY_TOPIC-hb/json?poll=1&since=20m" | jq -r 'select(.event=="message")|.message' | tail -1)
+          if [ -n "$MAC" ]; then
+            echo "Mac is awake; skipping items it already covered"
+            NEW=$(comm -23 <(echo "$NEW" | sed '/^$/d' | sort) <(echo "$MAC" | tr ',' '\n' | sort))
+          else
+            echo "No Mac heartbeat; cloud is sending alerts"
+          fi
+          for id in $NEW; do
+            line=$(echo "$NOW" | grep "^$id	")
+            price=$(echo "$line" | cut -f2); name=$(echo "$line" | cut -f3); stores=$(echo "$line" | cut -f4)
+            echo "IN STOCK $price $name [$stores]"
+            curl -s --max-time 15 -H "Title: CeX: RTX 5090 in stock" -H "Priority: high" -H "Tags: rotating_light" \
+              -H "Click: https://uk.webuy.com/product-detail?id=$id" -d "$price $name - $stores" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
+          done
+          [ -n "$CEX_TEST" ] && exit 0
+          echo "$NOW" > "$STATE"
+          echo "$(echo "$NOW" | sed '/^$/d' | wc -l) in stock"
+
+      - name: Save stock list if it changed
+        if: ${{ !inputs.test }}
+        run: |
+          git add instock.txt
+          git diff --cached --quiet && exit 0
+          git -c user.name="cex-alert" -c user.email="cex-alert@users.noreply.github.com" commit -m "Update stock list"
+          git push
